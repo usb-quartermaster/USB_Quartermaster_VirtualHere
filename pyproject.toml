@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Quartermaster support for managing VirtualHere Devices"
 authors = ["Tim Laurence <timdaman@gmail.com>"]
 packages = [
-    {include = "USB_Quartermaster_Usbip"}
+    {include = "USB_Quartermaster_VirtualHere"}
 ]
 
 [tool.poetry.dependencies]
