@@ -8,7 +8,8 @@ packages = [
 ]
 
 [tool.poetry.dependencies]
-python = "^3.8"
+python = "^3.7"
+USB_Quartermaster_common = "^0.1.0"
 
 [tool.poetry.dev-dependencies]
 pytest = "^5.2"
