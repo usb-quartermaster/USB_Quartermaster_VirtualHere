@@ -1,11 +1,12 @@
-import asyncio
 import logging
 import platform
 import re
-import shutil
-import subprocess
 import time
-from typing import Optional, NamedTuple, Dict, Iterable, List
+from multiprocessing import Process
+from multiprocessing import Queue
+from pathlib import Path
+from queue import Empty
+from typing import Optional, NamedTuple, Dict, Iterable
 from xml.etree import ElementTree
 from xml.etree.ElementTree import Element
 
@@ -13,6 +14,13 @@ from USB_Quartermaster_common import AbstractRemoteHostDriver, AbstractShareable
     AbstractLocalDriver
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_CLIENT_LINUX = "vhclientx86_64"
+DEFAULT_CLIENT_MAC = "/Applications/VirtualHere.app/Contents/MacOS/VirtualHere"
+DEFAULT_CLIENT_WINDOWS = "vhui64.exe"
+WINDOWS_PIPE = Path('\\\\.\\PIPE\\vhclient')
+POSIX_SEND_PIPE = Path('/tmp/vhclient')
+POSIX_RECV_PIPE = Path('/tmp/vhclient_response')
 
 
 class DeviceInfo(NamedTuple):
@@ -40,11 +48,11 @@ class VirtualHereOverSSHHost(AbstractRemoteHostDriver, DriverMetaData):
         if "virtualhere_command" in self.host.config:
             return self.host.config["virtualhere_command"]
         elif self.host.type == "Linux_AMD64":
-            return "vhclientx86_64"
+            return DEFAULT_CLIENT_LINUX
         elif self.host.type == "Windows":
-            return "vhui64.exe"
+            return DEFAULT_CLIENT_WINDOWS
         elif self.host.type == "Darwin":
-            return "/Applications/VirtualHere.app/Contents/MacOS/VirtualHere"
+            return DEFAULT_CLIENT_MAC
 
     def ssh(self, command: str) -> CommandResponse:
         response = self.communicator.execute_command(command=command)
@@ -67,8 +75,8 @@ class VirtualHereOverSSHHost(AbstractRemoteHostDriver, DriverMetaData):
         if self.host.type == "Windows":
             # This forces the the command shell to wait for the executable to exit before exiting ensuring
             # we get the output from VirtualHere.
-            full_command = f'start "quartermaster" /W {self.vh_client_cmd} -t "{command}" -r "quartermaster.tmp" ' \
-                           f'& type quartermaster.tmp ' \
+            full_command = f'start "quartermaster" /W {self.vh_client_cmd} -t "{command}" -r "quartermaster.tmp"' \
+                           f' & type quartermaster.tmp ' \
                            f'& del quartermaster.tmp'
         else:
             full_command = f'{self.vh_client_cmd} -t "{command}"'
@@ -97,12 +105,13 @@ class VirtualHereOverSSHHost(AbstractRemoteHostDriver, DriverMetaData):
         return None
 
     def _get_state_data(self) -> Element:
-        response = self.vh_command('GET CLIENT STATE')
+        vh_resp = self.vh_command('GET CLIENT STATE')
         try:
-            return ElementTree.fromstring(response.stdout)
-        except ElementTree.ParseError as e:
+            return ElementTree.fromstring(vh_resp.stdout)
+        except ElementTree.ParseError:
             raise self.VirtualHereExecutionError(f"Error parsing VirtualHere client status, "
-                                                 f"host={self.host.communicator}:{self.host.address} xml=>>{response.stdout}<< stderr=>>{response.stderr}<<")
+                                                 f"host={self.host.communicator}:{self.host.address} "
+                                                 f"xml=>>{vh_resp.stdout}<< stderr=>>{vh_resp.stderr}<<")
 
     def get_states(self) -> Dict[str, DeviceInfo]:
         state_data = self._get_state_data()
@@ -164,6 +173,8 @@ class VirtualHereOverSSH(AbstractShareableDeviceDriver, DriverMetaData):
     CONFIGURATION_KEYS = ("device_address",)
     CMD_TIMEOUT_SEC = 10
 
+    host_driver: 'VirtualHereOverSSHHost'
+
     class VirtualHereDriverError(AbstractShareableDeviceDriver.DeviceCommandError):
         pass
 
@@ -172,7 +183,7 @@ class VirtualHereOverSSH(AbstractShareableDeviceDriver, DriverMetaData):
 
     def get_share_state(self) -> bool:
         device_address = self.device.config['device_address']
-        states: List[DeviceInfo] = self.host_driver.get_states()
+        states = self.host_driver.get_states()
         if device_address in states:
             return states[device_address].shared
         else:
@@ -180,15 +191,15 @@ class VirtualHereOverSSH(AbstractShareableDeviceDriver, DriverMetaData):
 
     def get_online_state(self) -> bool:
         device_address = self.device.config['device_address']
-        states: List[DeviceInfo] = self.host_driver.get_states()
+        states = self.host_driver.get_states()
         return device_address in states
 
     def get_nickname(self) -> Optional[str]:
         device_address = self.device.config['device_address']
-        states: List[DeviceInfo] = self.host_driver.get_states()
-        if device_address in states:
+        states = self.host_driver.get_states()
+        try:
             return states[device_address].nickname
-        else:
+        except KeyError:
             raise self.DeviceNotFound(f"Did not find {device_address} on {self.device.host}")
 
     def set_nickname(self) -> None:
@@ -212,153 +223,117 @@ VirtualHereOverSSH.HOST_CLASS = VirtualHereOverSSHHost
 VirtualHereOverSSHHost.DEVICE_CLASS = VirtualHereOverSSH
 
 
+def windows_pipe_interactor(cmd: str, queue: Queue, named_pipe: Path = WINDOWS_PIPE):
+    """ This function is meant to be run in a separate process. This is to ensure it works on
+        windows where non-blocking reads of pipes is hard. I get around this block by isolating
+        the blocking susceptible code in separate process which we can terminate even when it is blocked.
+
+        Additionally windows VirtualHere is implement
+        """
+    with named_pipe.open('rb+') as pipe:
+        logger.debug(f"Sending {cmd} to VirtualHere")
+        pipe.write(cmd.encode('ascii'))
+        while True:
+            # I pull in 1 byte at time because the reads block until
+            # they get the target number of bytes
+            queue.put(pipe.read(1).decode('ascii'))
+
+
+def posix_pipe_interactor(cmd: str,
+                          queue: Queue,
+                          send_pipe: Path = POSIX_SEND_PIPE,
+                          recv_pipe: Path = POSIX_RECV_PIPE):
+    with send_pipe.open(mode='wb') as sp:
+        logger.debug(f"Sending {cmd} to VirtualHere")
+        sp.write(cmd.encode('ascii'))
+
+    with recv_pipe.open(mode="rb") as rp:
+        queue.put(rp.read().decode('ascii'))
+
+
+def time_limited_vh_request(cmd: str, timeout_secs: int = 5):
+    """
+    There are ways to do this on some platforms would resorting to using "Process"es.
+    The problem is the way to do this varies across platforms. I use Process
+    to drive up code reuse across platforms and make things, overall, simpler.
+
+    :param cmd: Command to executed
+    :param timeout_secs: Max time to wait for output
+    :return: The output
+    """
+    output_started = False
+    start_time = time.time()
+    q = Queue()
+    if platform.system() == "Windows":
+        p = Process(target=windows_pipe_interactor, args=(cmd, q))
+    else:
+        p = Process(target=posix_pipe_interactor, args=(cmd, q))
+    p.daemon = True
+    p.start()
+
+    # read without blocking
+    response = ''
+    while (time.time() - start_time) < timeout_secs:
+        # This is bit more complicated than might seem necessary
+        # On posix systems the read returns all of the output at once
+        # but on Windows output comes one byte a time so we could
+        # look at the queue before it is done being filled
+        try:
+            chunk = q.get(timeout=.1)
+            response += chunk
+            logger.debug(f"Got >>{chunk}<< from Virtualhere")
+            output_started = True
+        except Empty:
+            if output_started:
+                break
+    p.terminate()
+    return response
+
+
 class VirtualHereLocal(AbstractLocalDriver, DriverMetaData):
     OK_MATCHER = re.compile("^OK$", flags=re.MULTILINE)
-    LINUX_CLIENT_NAME = f"vhclient{platform.machine()}"
-
-    vh: str
 
     def __init__(self, conf):
         self.conf = conf
 
     def preflight_check(self):
         # Confirm VirtualHere client is installed and running
-        self.start_client_service()
+        # If we cannot get help text assume we re not running
+        help_text = time_limited_vh_request('help')
+        if not help_text:
+            raise self.DriverError(
+                "Could not connect to VirtualHere. Ensure the VirtualHere client service running")
+        self.attach_hub()
 
-    async def async_init(self):
-        self.vh = self.find_vh()
-        await self.attach_hub()
+    def run_vh(self, cmd: str) -> str:
+        return time_limited_vh_request(cmd)
 
-    def start_client_service(self):
-        target_platform = platform.system().lower()
-        if target_platform in ('darwin', 'mac', 'macos', 'macosx'):
-            self.setup_mac_client()
-        elif target_platform == 'linux':
-            self.setup_linux_client()
-        else:
-            raise self.UnsupportedPlatform(f"Unsupported platform {target_platform}")
-
-    @staticmethod
-    def mac_find_vh() -> Optional[str]:
-        try:
-            app_name_fragment = 'VirtualHere.app/Contents/MacOS/VirtualHere'
-            output = subprocess.check_output(('pgrep', '-lf', app_name_fragment),
-                                             encoding='utf-8')
-            # Find path in output, assume it looks like on the following
-            # '18643 /Applications/VirtualHere.app/Contents/MacOS/VirtualHere'
-            # '1598 /Applications/VirtualHere.app/Contents/MacOS/VirtualHere --log=OSEventLog -n'
-            match = re.match(f"^\d+ (?P<cmd>.+{app_name_fragment})", output.splitlines()[0])
-            return match['cmd']
-        except subprocess.CalledProcessError:
-            # Assume process is not running
-            return None
-
-    def linux_find_vh(self):
-        return shutil.which(self.LINUX_CLIENT_NAME)
-
-    def find_vh(self) -> str:
-        target_platform = platform.system().lower()
-        if target_platform in ('darwin', 'mac', 'macos', 'macosx'):
-            return self.mac_find_vh()
-        elif target_platform == 'linux':
-            return self.linux_find_vh()
-        else:
-            raise self.UnsupportedPlatform(f"Unsupported platform {target_platform}")
-
-    def setup_mac_client(self) -> List[str]:
-        # check if client is running and get path
-        vh_path = self.mac_find_vh()
-
-        if not vh_path:
-            # Assume process is not running
-            try:
-                print("Starting VirtualHere")
-                subprocess.check_call(('open', '-ga', 'VirtualHere'))
-                time.sleep(2)  # Give client service some time to start
-            except subprocess.CalledProcessError:
-                raise self.CommandError("Looks like VirtualHere might not be installed or runnable")
-            vh_path = self.mac_find_vh()
-
-        if vh_path is None:
-            # Start if needed and get path
-            try:
-                print("Starting VirtualHere")
-                subprocess.check_call(('open', '-ga', 'VirtualHere'))
-                time.sleep(2)  # Give client service some time to start
-            except subprocess.CalledProcessError:
-                raise self.CommandError("Looks like VirtualHere might not be installed or runnable")
-            vh_path = self.mac_find_vh()
-        return [vh_path]
-
-    def setup_linux_client(self):
-        # Check for sudo
-        sudo = shutil.which('sudo')
-        if not sudo:
-            raise self.CommandError("sudo is needed and was not found in path")
-
-        # Check for client
-        vhclient = self.linux_find_vh()
-        if not vhclient:
-            raise self.CommandError(
-                f"{self.LINUX_CLIENT_NAME} is needed and was not found in path. {self.setup_information()}")
-
-        # start client if needed
-        try:
-            subprocess.check_output(('pgrep', self.LINUX_CLIENT_NAME))
-        except subprocess.CalledProcessError:
-            # Assume client is not running if we get a non-zero
-            print("Starting VirtualHere client service, if this failed you may need to start it "
-                  f"manually by running `sudo {vhclient} -n`")
-            subprocess.check_call(('sudo', vhclient, '-n'))  # TODO: Can I pass through stdin?
-            time.sleep(2)  # Give client service some time to start
-
-    async def run_vh(self, args):
-        proc = await asyncio.create_subprocess_exec(
-            self.vh, *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT)
-        stdout, stderr = await proc.communicate()
-
-        if proc.returncode != 0:
-            stdout_str = stdout.decode('ascii')
-            stderr_str = ""
-            raise self.CommandError(
-                f'Error: command={self.vh} {args}, rc={proc.returncode}, stdout={stdout}, stderr={stderr}',
-                CommandResponse(return_code=proc.returncode, stdout=stdout_str, stderr=stderr_str),
-                [self.vh, *args]
-            )
-
-        return stdout.decode('ascii')
-
-    async def attach_hub(self):
-        args = ['-t', 'MANUAL HUB LIST']
-        hub_list = await self.run_vh(args)
-        for hub in hub_list.splitlines():
+    def attach_hub(self):
+        vh_resp = self.run_vh('MANUAL HUB LIST')
+        for hub in vh_resp.splitlines():
             if hub.startswith(self.conf['host_address']):  # Hub already connected
                 break
         else:
-            args = ['-t', f"MANUAL HUB ADD,{self.conf['host_address']}"]
-            output = await self.run_vh(args)
-            if not self.OK_MATCHER.search(output):
-                raise self.CommandError(
+            vh_resp = self.run_vh(f"MANUAL HUB ADD,{self.conf['host_address']}")
+            if not self.OK_MATCHER.search(vh_resp):
+                raise self.DriverError(
                     f"VirtualHere did not return 'OK' when connecting hub '{self.conf['host_address']}', "
-                    f"instead I got '{output}'"
+                    f"instead I got '{vh_resp}'"
                 )
 
-    async def connect(self):
-        args = ['-t', f"USE,{self.conf['device_address']}"]
-        output = await self.run_vh(args)
-        if not self.OK_MATCHER.search(output):
-            raise self.CommandError(f"VirtualHere did not return 'OK' when connecting device, instead I got '{output}'")
+    def connect(self):
+        vh_resp = self.run_vh(f"USE,{self.conf['device_address']}")
+        if not self.OK_MATCHER.search(vh_resp):
+            raise self.DriverError(f"VirtualHere did not return 'OK' when connecting device, instead I got "
+                                   f"'{vh_resp}'")
 
-    async def disconnect(self):
-        args = ['-t', f"STOP USING,{self.conf['device_address']}"]
-        output = await self.run_vh(args)
-        if not self.OK_MATCHER.search(output):
-            raise self.CommandError(
-                f"VirtualHere did not return 'OK' when disconnecting device, instead I got '{output}'")
+    def disconnect(self):
+        vh_resp = self.run_vh(f"STOP USING,{self.conf['device_address']}")
+        if not self.OK_MATCHER.search(vh_resp):
+            raise self.DriverError(
+                f"VirtualHere did not return 'OK' when disconnecting device, instead I got '{vh_resp}'")
 
-    async def connected(self) -> bool:
+    def connected(self) -> bool:
         """
         # vhclientx86_64 -t 'device info,spf3-topaz-1.17'
         ADDRESS: spf3-topaz-1.17
@@ -370,9 +345,8 @@ class VirtualHereLocal(AbstractLocalDriver, DriverMetaData):
         NICKNAME: KonaFrames01
         IN USE BY: NO ONE
         """
-        args = ['-t', f"DEVICE INFO,{self.conf['device_address']}"]
-        output = await self.run_vh(args)
-        return "IN USE BY: NO ONE" not in output
+        vh_resp = self.run_vh(f"DEVICE INFO,{self.conf['device_address']}")
+        return "IN USE BY: NO ONE" not in vh_resp
 
     def setup_information(self):
         return "To use these Virtual here resources you must have the VirtualHere client installed and running. " \
