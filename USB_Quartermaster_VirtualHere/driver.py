@@ -79,7 +79,24 @@ class VirtualHereOverSSHHost(AbstractRemoteHostDriver, DriverMetaData):
                            f' & type quartermaster.tmp ' \
                            f'& del quartermaster.tmp'
         else:
-            full_command = f'{self.vh_client_cmd} -t "{command}"'
+            # Let me unpack this
+            #
+            # Why am I not using the native client? Because I am not sure where it is located. Rather than add
+            # complexity to find the command and run it I have elected to use the pipe interface which  leads to
+            # simpler code
+            #
+            # What is up with the timeouts? Turns out the cat commands will hang if the service is not running.
+            #
+            # Why do you start by reading vhclient_response before issuing any commands? I have found old commands
+            # can leave output behind. The preemptive read ensures those are flushed so we can be sure we are getting
+            # the results of our input
+            #
+            # Where can I find doc on the pipe interface? https://www.virtualhere.com/client_api
+            cmd_timeout = 1
+            full_command = f'timeout {cmd_timeout} cat /tmp/vhclient_response > /dev/null ' \
+                           f'&& timeout {cmd_timeout} echo "{command}" > /tmp/vhclient ' \
+                           f'&& sleep 1 ' \
+                           f'&& timeout {cmd_timeout} cat /tmp/vhclient_response'
 
         try:
             response = self.ssh(full_command)
