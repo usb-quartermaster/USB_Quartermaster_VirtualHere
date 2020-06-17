@@ -93,8 +93,8 @@ class VirtualHereOverSSHHost(AbstractRemoteHostDriver, DriverMetaData):
             #
             # Where can I find doc on the pipe interface? https://www.virtualhere.com/client_api
             cmd_timeout = 1
-            full_command = f'timeout {cmd_timeout} cat /tmp/vhclient_response > /dev/null ' \
-                           f'&& timeout {cmd_timeout} echo "{command}" > /tmp/vhclient ' \
+            full_command = f'timeout {cmd_timeout} cat /tmp/vhclient_response > /dev/null;' \
+                           f'timeout {cmd_timeout} echo "{command}" > /tmp/vhclient ' \
                            f'&& sleep 1 ' \
                            f'&& timeout {cmd_timeout} cat /tmp/vhclient_response'
 
@@ -124,11 +124,12 @@ class VirtualHereOverSSHHost(AbstractRemoteHostDriver, DriverMetaData):
     def _get_state_data(self) -> Element:
         vh_resp = self.vh_command('GET CLIENT STATE')
         try:
-            return ElementTree.fromstring(vh_resp.stdout)
-        except ElementTree.ParseError:
+            return ElementTree.fromstring(vh_resp.stdout.replace('\x01',''))
+        except ElementTree.ParseError as e:
             raise self.VirtualHereExecutionError(f"Error parsing VirtualHere client status, "
                                                  f"host={self.host.communicator}:{self.host.address} "
-                                                 f"xml=>>{vh_resp.stdout}<< stderr=>>{vh_resp.stderr}<<")
+                                                 f"xml=>>{vh_resp.stdout}<< stderr=>>{vh_resp.stderr}<< "
+                                                 f"error={repr(e)}")
 
     def get_states(self) -> Dict[str, DeviceInfo]:
         state_data = self._get_state_data()
